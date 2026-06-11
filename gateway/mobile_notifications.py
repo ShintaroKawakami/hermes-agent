@@ -45,14 +45,28 @@ class MobileNotificationStore:
             raise MobileNotificationStoreError(
                 "Failed to open mobile notification store"
             ) from exc
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA foreign_keys = ON")
+        try:
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA foreign_keys = ON")
 
-        from hermes_state import apply_wal_with_fallback
+            from hermes_state import apply_wal_with_fallback
 
-        apply_wal_with_fallback(self._conn, db_label="mobile_notifications.db")
-        self._init_schema()
-        self._tighten_file_permissions()
+            apply_wal_with_fallback(self._conn, db_label="mobile_notifications.db")
+            self._init_schema()
+            self._tighten_file_permissions()
+        except Exception as exc:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            logger.error(
+                "Failed to initialize mobile notification store at %s",
+                db_path,
+                exc_info=True,
+            )
+            raise MobileNotificationStoreError(
+                "Failed to initialize mobile notification store"
+            ) from exc
 
     def _init_schema(self) -> None:
         self._conn.execute(

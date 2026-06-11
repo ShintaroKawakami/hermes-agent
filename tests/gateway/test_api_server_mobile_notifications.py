@@ -3,13 +3,16 @@
 import os
 import sqlite3
 import stat
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
+from gateway.mobile_notifications import MobileNotificationStore
 from gateway.platforms.api_server import APIServerAdapter, cors_middleware
 
 
@@ -273,6 +276,48 @@ def test_done_action_is_unique_per_notification_group(adapter):
             )
 
 
+def test_concurrent_mobile_notification_actions_resolve_once(tmp_path):
+    db_path = str(tmp_path / "mobile_notifications.db")
+    writer_store = MobileNotificationStore(db_path)
+    writer_store.upsert_notification(
+        {
+            "id": "remember-race",
+            "kind": "memory_approval",
+            "title": "同時回答があります",
+            "body": "片方だけ通します。",
+        },
+        actions=[
+            {"id": "yes", "group_key": "race", "label": "はい", "value": "approve"},
+            {"id": "no", "group_key": "race", "label": "いいえ", "value": "reject"},
+        ],
+    )
+    store_a = MobileNotificationStore(db_path)
+    store_b = MobileNotificationStore(db_path)
+    barrier = threading.Barrier(2)
+
+    def resolve(store, action_id):
+        barrier.wait(timeout=5)
+        result, _notification = store.resolve_action("remember-race", action_id)
+        return result
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = [
+            future.result(timeout=5)
+            for future in (
+                executor.submit(resolve, store_a, "yes"),
+                executor.submit(resolve, store_b, "no"),
+            )
+        ]
+
+    assert sorted(results) == ["conflict", "ok"]
+    notification = writer_store.get_notification("remember-race")
+    done_actions = [
+        action for action in notification["actions"] if action["status"] == "done"
+    ]
+    assert len(done_actions) == 1
+    assert notification["status"] == "closed"
+
+
 @pytest.mark.asyncio
 async def test_mobile_notification_validation_errors(adapter):
     _seed_approval(adapter)
@@ -306,6 +351,23 @@ async def test_mobile_capabilities_advertise_inbox(adapter):
 async def test_mobile_notification_store_unavailable_returns_503(tmp_path, monkeypatch):
     missing_parent = tmp_path / "missing" / "nested"
     monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: missing_parent)
+    adapter = _make_adapter()
+    app = _create_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get("/api/mobile/notifications")
+        data = await resp.json()
+
+    assert resp.status == 503
+    assert data["error"] == "Mobile notification store unavailable"
+
+
+@pytest.mark.asyncio
+async def test_mobile_notification_store_init_failure_returns_503(tmp_path, monkeypatch):
+    def fail_schema(_store):
+        raise sqlite3.DatabaseError("broken schema")
+
+    monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(MobileNotificationStore, "_init_schema", fail_schema)
     adapter = _make_adapter()
     app = _create_app(adapter)
     async with TestClient(TestServer(app)) as cli:
