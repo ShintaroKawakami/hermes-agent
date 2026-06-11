@@ -1,5 +1,6 @@
 """SQLite-backed mobile notification inbox for Hermes WebUI clients."""
 
+import logging
 import sqlite3
 import time
 import uuid
@@ -11,6 +12,11 @@ OPEN_STATUSES = ("unread", "read")
 CLOSED_STATUSES = ("closed", "expired")
 VALID_NOTIFICATION_STATUSES = OPEN_STATUSES + CLOSED_STATUSES
 VALID_ACTION_STATUSES = ("pending", "done", "rejected")
+logger = logging.getLogger(__name__)
+
+
+class MobileNotificationStoreError(RuntimeError):
+    """Raised when the mobile notification store cannot be initialized."""
 
 
 class MobileNotificationStore:
@@ -22,15 +28,23 @@ class MobileNotificationStore:
                 from hermes_cli.config import get_hermes_home
 
                 db_path = str(get_hermes_home() / "mobile_notifications.db")
-            except Exception:
-                db_path = ":memory:"
+            except Exception as exc:
+                raise MobileNotificationStoreError(
+                    "Failed to resolve Hermes home for mobile notifications"
+                ) from exc
 
         self._db_path: Optional[str] = db_path if db_path != ":memory:" else None
         try:
             self._conn = sqlite3.connect(db_path, check_same_thread=False)
-        except Exception:
-            self._conn = sqlite3.connect(":memory:", check_same_thread=False)
-            self._db_path = None
+        except Exception as exc:
+            logger.error(
+                "Failed to open mobile notification store at %s",
+                db_path,
+                exc_info=True,
+            )
+            raise MobileNotificationStoreError(
+                "Failed to open mobile notification store"
+            ) from exc
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
 
@@ -56,7 +70,7 @@ class MobileNotificationStore:
         )
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS mobile_notification_actions (
-                id TEXT PRIMARY KEY,
+                id TEXT NOT NULL,
                 notification_id TEXT NOT NULL,
                 group_key TEXT NOT NULL,
                 label TEXT NOT NULL,
@@ -64,6 +78,7 @@ class MobileNotificationStore:
                 status TEXT NOT NULL DEFAULT 'pending',
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
+                PRIMARY KEY(notification_id, id),
                 FOREIGN KEY(notification_id)
                     REFERENCES mobile_notifications(id)
                     ON DELETE CASCADE
@@ -76,6 +91,11 @@ class MobileNotificationStore:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_mobile_notification_actions_parent "
             "ON mobile_notification_actions(notification_id, group_key, status)"
+        )
+        self._conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_mobile_notification_actions_done_group
+            ON mobile_notification_actions(notification_id, group_key)
+            WHERE status = 'done'"""
         )
         self._conn.commit()
 
@@ -116,41 +136,17 @@ class MobileNotificationStore:
             expires_at = float(expires_at)
         created_at = float(notification.get("created_at") or now)
 
-        self._conn.execute(
-            """INSERT INTO mobile_notifications (
-                id, kind, title, body, detail_ref, status, expires_at,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                kind=excluded.kind,
-                title=excluded.title,
-                body=excluded.body,
-                detail_ref=excluded.detail_ref,
-                status=excluded.status,
-                expires_at=excluded.expires_at,
-                updated_at=excluded.updated_at""",
-            (
-                notification_id,
-                kind,
-                title,
-                body,
-                detail_ref,
-                status,
-                expires_at,
-                created_at,
-                now,
-            ),
-        )
-
+        validated_actions = None
         if actions is not None:
-            self._conn.execute(
-                "DELETE FROM mobile_notification_actions WHERE notification_id = ?",
-                (notification_id,),
-            )
+            validated_actions = []
+            seen_action_ids = set()
             for raw_action in actions:
                 action_id = self._clean_text(
                     raw_action.get("id") or f"act_{uuid.uuid4().hex}", "action_id", 128
                 )
+                if action_id in seen_action_ids:
+                    raise ValueError("Duplicate action_id for notification")
+                seen_action_ids.add(action_id)
                 group_key = self._clean_text(
                     raw_action.get("group_key") or "default", "group_key", 128
                 )
@@ -159,24 +155,51 @@ class MobileNotificationStore:
                 action_status = raw_action.get("status") or "pending"
                 if action_status not in VALID_ACTION_STATUSES:
                     raise ValueError("Invalid action status")
-                self._conn.execute(
-                    """INSERT INTO mobile_notification_actions (
-                        id, notification_id, group_key, label, value, status,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        action_id,
-                        notification_id,
-                        group_key,
-                        label,
-                        value,
-                        action_status,
-                        now,
-                        now,
-                    ),
+                validated_actions.append(
+                    (action_id, notification_id, group_key, label, value, action_status, now, now)
                 )
 
-        self._conn.commit()
+        with self._conn:
+            self._conn.execute(
+                """INSERT INTO mobile_notifications (
+                    id, kind, title, body, detail_ref, status, expires_at,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    kind=excluded.kind,
+                    title=excluded.title,
+                    body=excluded.body,
+                    detail_ref=excluded.detail_ref,
+                    status=excluded.status,
+                    expires_at=excluded.expires_at,
+                    updated_at=excluded.updated_at""",
+                (
+                    notification_id,
+                    kind,
+                    title,
+                    body,
+                    detail_ref,
+                    status,
+                    expires_at,
+                    created_at,
+                    now,
+                ),
+            )
+
+            if validated_actions is not None:
+                self._conn.execute(
+                    "DELETE FROM mobile_notification_actions WHERE notification_id = ?",
+                    (notification_id,),
+                )
+                for validated_action in validated_actions:
+                    self._conn.execute(
+                        """INSERT INTO mobile_notification_actions (
+                            id, notification_id, group_key, label, value, status,
+                            created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        validated_action,
+                    )
+
         self._tighten_file_permissions()
         return self.get_notification(notification_id) or {}
 
@@ -220,11 +243,11 @@ class MobileNotificationStore:
         if row is None:
             return None
         if row["status"] == "unread":
-            self._conn.execute(
-                "UPDATE mobile_notifications SET status = 'read', updated_at = ? WHERE id = ?",
-                (time.time(), notification_id),
-            )
-            self._conn.commit()
+            with self._conn:
+                self._conn.execute(
+                    "UPDATE mobile_notifications SET status = 'read', updated_at = ? WHERE id = ?",
+                    (time.time(), notification_id),
+                )
         return self.get_notification(notification_id)
 
     def resolve_action(
@@ -233,58 +256,84 @@ class MobileNotificationStore:
         action_id: str,
     ) -> Tuple[str, Optional[Dict[str, Any]]]:
         self.expire_due()
-        notification = self.get_notification(notification_id)
-        if notification is None:
-            return "not_found", None
-        if notification["status"] == "expired":
-            return "expired", notification
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            notification_row = self._conn.execute(
+                "SELECT * FROM mobile_notifications WHERE id = ?",
+                (notification_id,),
+            ).fetchone()
+            if notification_row is None:
+                self._conn.rollback()
+                return "not_found", None
+            if notification_row["status"] == "expired":
+                notification = self._row_to_notification(notification_row)
+                self._conn.rollback()
+                return "expired", notification
 
-        action_row = self._conn.execute(
-            """SELECT * FROM mobile_notification_actions
-            WHERE notification_id = ? AND id = ?""",
-            (notification_id, action_id),
-        ).fetchone()
-        if action_row is None:
-            return "not_found", notification
-        if action_row["status"] == "done":
-            return "ok", notification
-        if action_row["status"] != "pending":
-            return "conflict", notification
+            action_row = self._conn.execute(
+                """SELECT * FROM mobile_notification_actions
+                WHERE notification_id = ? AND id = ?""",
+                (notification_id, action_id),
+            ).fetchone()
+            if action_row is None:
+                notification = self._row_to_notification(notification_row)
+                self._conn.rollback()
+                return "not_found", notification
+            if action_row["status"] == "done":
+                notification = self._row_to_notification(notification_row)
+                self._conn.rollback()
+                return "ok", notification
+            if action_row["status"] != "pending":
+                notification = self._row_to_notification(notification_row)
+                self._conn.rollback()
+                return "conflict", notification
 
-        done_sibling = self._conn.execute(
-            """SELECT id FROM mobile_notification_actions
-            WHERE notification_id = ? AND group_key = ? AND status = 'done'
-            LIMIT 1""",
-            (notification_id, action_row["group_key"]),
-        ).fetchone()
-        if done_sibling is not None:
-            return "conflict", notification
+            done_sibling = self._conn.execute(
+                """SELECT id FROM mobile_notification_actions
+                WHERE notification_id = ? AND group_key = ? AND status = 'done'
+                LIMIT 1""",
+                (notification_id, action_row["group_key"]),
+            ).fetchone()
+            if done_sibling is not None:
+                notification = self._row_to_notification(notification_row)
+                self._conn.rollback()
+                return "conflict", notification
 
-        now = time.time()
-        self._conn.execute(
-            """UPDATE mobile_notification_actions
-            SET status = 'done', updated_at = ?
-            WHERE notification_id = ? AND id = ?""",
-            (now, notification_id, action_id),
-        )
-        self._conn.execute(
-            """UPDATE mobile_notification_actions
-            SET status = 'rejected', updated_at = ?
-            WHERE notification_id = ? AND group_key = ? AND id != ? AND status = 'pending'""",
-            (now, notification_id, action_row["group_key"], action_id),
-        )
-
-        pending = self._conn.execute(
-            """SELECT COUNT(*) FROM mobile_notification_actions
-            WHERE notification_id = ? AND status = 'pending'""",
-            (notification_id,),
-        ).fetchone()[0]
-        if pending == 0:
-            self._conn.execute(
-                "UPDATE mobile_notifications SET status = 'closed', updated_at = ? WHERE id = ?",
-                (now, notification_id),
+            now = time.time()
+            cursor = self._conn.execute(
+                """UPDATE mobile_notification_actions
+                SET status = 'done', updated_at = ?
+                WHERE notification_id = ? AND id = ? AND status = 'pending'""",
+                (now, notification_id, action_id),
             )
-        self._conn.commit()
+            if cursor.rowcount != 1:
+                notification = self._row_to_notification(notification_row)
+                self._conn.rollback()
+                return "conflict", notification
+            self._conn.execute(
+                """UPDATE mobile_notification_actions
+                SET status = 'rejected', updated_at = ?
+                WHERE notification_id = ? AND group_key = ? AND id != ? AND status = 'pending'""",
+                (now, notification_id, action_row["group_key"], action_id),
+            )
+
+            pending = self._conn.execute(
+                """SELECT COUNT(*) FROM mobile_notification_actions
+                WHERE notification_id = ? AND status = 'pending'""",
+                (notification_id,),
+            ).fetchone()[0]
+            if pending == 0:
+                self._conn.execute(
+                    "UPDATE mobile_notifications SET status = 'closed', updated_at = ? WHERE id = ?",
+                    (now, notification_id),
+                )
+            self._conn.commit()
+        except sqlite3.IntegrityError:
+            self._conn.rollback()
+            return "conflict", self.get_notification(notification_id)
+        except Exception:
+            self._conn.rollback()
+            raise
         return "ok", self.get_notification(notification_id)
 
     def expire_due(self, now: Optional[float] = None) -> int:
@@ -299,16 +348,16 @@ class MobileNotificationStore:
             return 0
         ids = [row["id"] for row in rows]
         placeholders = ",".join("?" for _ in ids)
-        self._conn.execute(
-            f"UPDATE mobile_notifications SET status = 'expired', updated_at = ? WHERE id IN ({placeholders})",
-            [now] + ids,
-        )
-        self._conn.execute(
-            f"UPDATE mobile_notification_actions SET status = 'rejected', updated_at = ? "
-            f"WHERE notification_id IN ({placeholders}) AND status = 'pending'",
-            [now] + ids,
-        )
-        self._conn.commit()
+        with self._conn:
+            self._conn.execute(
+                f"UPDATE mobile_notifications SET status = 'expired', updated_at = ? WHERE id IN ({placeholders})",
+                [now] + ids,
+            )
+            self._conn.execute(
+                f"UPDATE mobile_notification_actions SET status = 'rejected', updated_at = ? "
+                f"WHERE notification_id IN ({placeholders}) AND status = 'pending'",
+                [now] + ids,
+            )
         return len(ids)
 
     def _row_to_notification(self, row: sqlite3.Row) -> Dict[str, Any]:

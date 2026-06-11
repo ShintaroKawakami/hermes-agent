@@ -1,6 +1,7 @@
 """Tests for the Hermes mobile notification inbox API."""
 
 import os
+import sqlite3
 import stat
 import time
 
@@ -75,6 +76,32 @@ def _seed_approval(adapter: APIServerAdapter, expires_at=None):
     )
 
 
+def _seed_second_approval(adapter: APIServerAdapter):
+    return adapter._get_mobile_notifications().upsert_notification(
+        {
+            "id": "remember-2",
+            "kind": "memory_approval",
+            "title": "別の保存候補があります",
+            "body": "こちらも確認してください。",
+            "detail_ref": "memory-review:2026-06-12",
+        },
+        actions=[
+            {
+                "id": "yes",
+                "group_key": "remember-2",
+                "label": "はい",
+                "value": "approve",
+            },
+            {
+                "id": "no",
+                "group_key": "remember-2",
+                "label": "いいえ",
+                "value": "reject",
+            },
+        ],
+    )
+
+
 @pytest.mark.asyncio
 async def test_mobile_notifications_require_auth(auth_adapter):
     app = _create_app(auth_adapter)
@@ -121,6 +148,54 @@ async def test_list_mobile_notifications_returns_open_items(adapter):
 
     assert [item["id"] for item in data["notifications"]] == ["remember-1"]
     assert {action["id"] for action in data["notifications"][0]["actions"]} == {"yes", "no"}
+
+
+def test_action_ids_are_scoped_to_each_notification(adapter):
+    _seed_approval(adapter)
+    _seed_second_approval(adapter)
+
+    notifications = adapter._get_mobile_notifications().list_notifications(status="open")
+    by_id = {item["id"]: item for item in notifications}
+    assert set(by_id) == {"remember-1", "remember-2"}
+    assert {action["id"] for action in by_id["remember-1"]["actions"]} == {"yes", "no"}
+    assert {action["id"] for action in by_id["remember-2"]["actions"]} == {"yes", "no"}
+
+
+def test_duplicate_action_ids_within_notification_are_rejected(adapter):
+    with pytest.raises(ValueError, match="Duplicate action_id"):
+        adapter._get_mobile_notifications().upsert_notification(
+            {
+                "id": "remember-duplicate",
+                "kind": "memory_approval",
+                "title": "重複があります",
+                "body": "同じaction idです。",
+            },
+            actions=[
+                {"id": "yes", "group_key": "remember-duplicate", "label": "はい", "value": "a"},
+                {"id": "yes", "group_key": "remember-duplicate", "label": "はい", "value": "b"},
+            ],
+        )
+
+
+def test_upsert_rolls_back_when_action_insert_fails(adapter):
+    _seed_approval(adapter)
+    with pytest.raises(sqlite3.IntegrityError):
+        adapter._get_mobile_notifications().upsert_notification(
+            {
+                "id": "remember-1",
+                "kind": "memory_approval",
+                "title": "壊れた更新",
+                "body": "これは保存されません。",
+            },
+            actions=[
+                {"id": "yes", "group_key": "g1", "label": "はい", "value": "approve", "status": "done"},
+                {"id": "no", "group_key": "g1", "label": "いいえ", "value": "reject", "status": "done"},
+            ],
+        )
+
+    notification = adapter._get_mobile_notifications().get_notification("remember-1")
+    assert notification["title"] == "保存候補があります"
+    assert {action["id"] for action in notification["actions"]} == {"yes", "no"}
 
 
 @pytest.mark.asyncio
@@ -179,6 +254,25 @@ async def test_resolve_expired_mobile_notification_returns_gone(adapter):
     assert data["notification"]["status"] == "expired"
 
 
+def test_done_action_is_unique_per_notification_group(adapter):
+    _seed_approval(adapter)
+    store = adapter._get_mobile_notifications()
+    with pytest.raises(sqlite3.IntegrityError):
+        with store._conn:
+            store._conn.execute(
+                """UPDATE mobile_notification_actions
+                SET status = 'done'
+                WHERE notification_id = ? AND id = ?""",
+                ("remember-1", "yes"),
+            )
+            store._conn.execute(
+                """UPDATE mobile_notification_actions
+                SET status = 'done'
+                WHERE notification_id = ? AND id = ?""",
+                ("remember-1", "no"),
+            )
+
+
 @pytest.mark.asyncio
 async def test_mobile_notification_validation_errors(adapter):
     _seed_approval(adapter)
@@ -206,6 +300,20 @@ async def test_mobile_capabilities_advertise_inbox(adapter):
 
     assert data["features"]["mobile_notifications"] is True
     assert data["endpoints"]["mobile_notifications"]["path"] == "/api/mobile/notifications"
+
+
+@pytest.mark.asyncio
+async def test_mobile_notification_store_unavailable_returns_503(tmp_path, monkeypatch):
+    missing_parent = tmp_path / "missing" / "nested"
+    monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: missing_parent)
+    adapter = _make_adapter()
+    app = _create_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get("/api/mobile/notifications")
+        data = await resp.json()
+
+    assert resp.status == 503
+    assert data["error"] == "Mobile notification store unavailable"
 
 
 def test_mobile_notification_db_is_owner_only(tmp_path, monkeypatch):

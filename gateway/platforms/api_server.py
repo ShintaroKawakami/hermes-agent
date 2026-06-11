@@ -56,7 +56,10 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
-from gateway.mobile_notifications import MobileNotificationStore
+from gateway.mobile_notifications import (
+    MobileNotificationStore,
+    MobileNotificationStoreError,
+)
 from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
@@ -925,6 +928,20 @@ class APIServerAdapter(BasePlatformAdapter):
             self._mobile_notifications = MobileNotificationStore()
         return self._mobile_notifications
 
+    def _mobile_notification_store_unavailable_response(
+        self,
+        exc: Exception,
+    ) -> "web.Response":
+        logger.error(
+            "Mobile notification store unavailable for %s",
+            self.name,
+            exc_info=exc,
+        )
+        return web.json_response(
+            {"error": "Mobile notification store unavailable"},
+            status=503,
+        )
+
     # ------------------------------------------------------------------
     # Session header helpers
     # ------------------------------------------------------------------
@@ -1230,10 +1247,13 @@ class APIServerAdapter(BasePlatformAdapter):
         if limit < 1 or limit > 100:
             return web.json_response({"error": "limit must be between 1 and 100"}, status=400)
 
-        notifications = self._get_mobile_notifications().list_notifications(
-            status=status,
-            limit=limit,
-        )
+        try:
+            notifications = self._get_mobile_notifications().list_notifications(
+                status=status,
+                limit=limit,
+            )
+        except MobileNotificationStoreError as exc:
+            return self._mobile_notification_store_unavailable_response(exc)
         return web.json_response({"notifications": notifications})
 
     async def _handle_mark_mobile_notification_read(self, request: "web.Request") -> "web.Response":
@@ -1246,7 +1266,10 @@ class APIServerAdapter(BasePlatformAdapter):
         if not notification_id:
             return web.json_response({"error": "notification_id is required"}, status=400)
 
-        notification = self._get_mobile_notifications().mark_read(notification_id)
+        try:
+            notification = self._get_mobile_notifications().mark_read(notification_id)
+        except MobileNotificationStoreError as exc:
+            return self._mobile_notification_store_unavailable_response(exc)
         if notification is None:
             return web.json_response({"error": "Notification not found"}, status=404)
         return web.json_response({"notification": notification})
@@ -1272,10 +1295,13 @@ class APIServerAdapter(BasePlatformAdapter):
         if not isinstance(action_id, str) or not action_id.strip():
             return web.json_response({"error": "action_id is required"}, status=400)
 
-        result, notification = self._get_mobile_notifications().resolve_action(
-            notification_id,
-            action_id.strip(),
-        )
+        try:
+            result, notification = self._get_mobile_notifications().resolve_action(
+                notification_id,
+                action_id.strip(),
+            )
+        except MobileNotificationStoreError as exc:
+            return self._mobile_notification_store_unavailable_response(exc)
         if result == "not_found":
             return web.json_response({"error": "Notification or action not found"}, status=404)
         if result == "expired":
