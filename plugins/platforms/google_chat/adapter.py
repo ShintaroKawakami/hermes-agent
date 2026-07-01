@@ -32,7 +32,8 @@ Event type routing
 Inbound envelope carries ``type`` in [MESSAGE, ADDED_TO_SPACE, REMOVED_FROM_SPACE,
 CARD_CLICKED]. Only MESSAGE dispatches to the agent. ADDED_TO_SPACE caches the
 bot's resource name (belt-and-suspenders on top of eager resolution in connect()).
-CARD_CLICKED is ACK'd only in v1 (follow-up PR implements interactivity).
+GBrain weekly-review CARD_CLICKED actions are handled locally; unsupported card
+actions are safely ACK'd without dispatching to the agent.
 """
 
 from __future__ import annotations
@@ -691,6 +692,231 @@ class GoogleChatAdapter(BasePlatformAdapter):
         future.add_done_callback(self._log_background_failure)
 
     # ------------------------------------------------------------------
+    # Google Chat card actions
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _walk_mappings(value: Any) -> List[Dict[str, Any]]:
+        found: List[Dict[str, Any]] = []
+        if isinstance(value, dict):
+            found.append(value)
+            for child in value.values():
+                found.extend(GoogleChatAdapter._walk_mappings(child))
+        elif isinstance(value, list):
+            for child in value:
+                found.extend(GoogleChatAdapter._walk_mappings(child))
+        return found
+
+    @staticmethod
+    def _normalize_card_parameters(value: Any) -> Dict[str, str]:
+        params: Dict[str, str] = {}
+        if isinstance(value, dict):
+            for key, raw in value.items():
+                if raw is None:
+                    continue
+                params[str(key)] = str(raw)
+            return params
+        if isinstance(value, list):
+            for item in value:
+                if not isinstance(item, dict):
+                    continue
+                key = item.get("key") or item.get("name")
+                if not key:
+                    continue
+                raw = item.get("value")
+                if raw is None:
+                    raw = item.get("stringValue")
+                if raw is None:
+                    continue
+                params[str(key)] = str(raw)
+        return params
+
+    @staticmethod
+    def _extract_form_input_value(form_inputs: Any, field_name: str) -> str:
+        if not isinstance(form_inputs, dict):
+            return ""
+
+        def _value_from_entry(entry: Any) -> str:
+            if isinstance(entry, str):
+                return entry
+            if not isinstance(entry, dict):
+                return ""
+            string_inputs = entry.get("stringInputs") or {}
+            if isinstance(string_inputs, dict):
+                values = string_inputs.get("value")
+                if isinstance(values, list) and values:
+                    return str(values[0])
+                if isinstance(values, str):
+                    return values
+            text_input = entry.get("textInput") or {}
+            if isinstance(text_input, dict) and text_input.get("value") is not None:
+                return str(text_input.get("value"))
+            if entry.get("value") is not None:
+                return str(entry.get("value"))
+            return ""
+
+        if field_name and field_name in form_inputs:
+            return _value_from_entry(form_inputs.get(field_name))
+        for key, entry in form_inputs.items():
+            if str(key).startswith("revision"):
+                value = _value_from_entry(entry)
+                if value:
+                    return value
+        for entry in form_inputs.values():
+            value = _value_from_entry(entry)
+            if value:
+                return value
+        return ""
+
+    def _extract_gbrain_weekly_review_action(
+        self, envelope: Dict[str, Any]
+    ) -> Optional[Dict[str, str]]:
+        """Return a sanitized GBrain weekly-review action payload.
+
+        This deliberately extracts only action metadata. It does not log or
+        forward the full Google Chat event body, which can contain user data.
+        """
+        common: Dict[str, Any] = {}
+        action_block: Dict[str, Any] = {}
+        message_block: Dict[str, Any] = {}
+        space_block: Dict[str, Any] = {}
+        thread_block: Dict[str, Any] = {}
+
+        for item in self._walk_mappings(envelope):
+            if not common and isinstance(item.get("common"), dict):
+                common = item.get("common") or {}
+            if not action_block and isinstance(item.get("action"), dict):
+                action_block = item.get("action") or {}
+            if not message_block:
+                name = item.get("name")
+                if isinstance(name, str) and "/messages/" in name:
+                    message_block = item
+            if not space_block and isinstance(item.get("space"), dict):
+                space_block = item.get("space") or {}
+            if not thread_block and isinstance(item.get("thread"), dict):
+                thread_block = item.get("thread") or {}
+
+        invoked = (
+            common.get("invokedFunction")
+            or action_block.get("function")
+            or action_block.get("actionMethodName")
+            or ""
+        )
+        if not isinstance(invoked, str):
+            return None
+        prefix = "gbrain_weekly_review_"
+        if not invoked.startswith(prefix):
+            return None
+        action = invoked[len(prefix):]
+        if action not in {"approve", "reject", "revise", "revise_submit"}:
+            return None
+
+        params: Dict[str, str] = {}
+        params.update(self._normalize_card_parameters(common.get("parameters")))
+        params.update(self._normalize_card_parameters(action_block.get("parameters")))
+        candidate_id = params.get("candidate_id", "")
+        if not candidate_id:
+            return None
+        revision_field = params.get("revision_field", "")
+        revision = self._extract_form_input_value(
+            common.get("formInputs") or {}, revision_field
+        )
+
+        space_name = (
+            (message_block.get("space") or {}).get("name")
+            or space_block.get("name")
+            or ""
+        )
+        thread_name = (
+            (message_block.get("thread") or {}).get("name")
+            or thread_block.get("name")
+            or ""
+        )
+        return {
+            "action": action,
+            "candidate_id": candidate_id,
+            "revision": revision,
+            "message_name": str(message_block.get("name") or ""),
+            "space_name": str(space_name or ""),
+            "thread_name": str(thread_name or ""),
+        }
+
+    async def _handle_gbrain_weekly_review_action(
+        self, payload: Dict[str, str]
+    ) -> None:
+        script = os.getenv(
+            "GBRAIN_WEEKLY_REVIEW_SCRIPT",
+            str(_Path.home() / ".hermes" / "scripts" / "gbrain-weekly-review.sh"),
+        )
+        args = [
+            script,
+            "--action",
+            payload.get("action", ""),
+            "--candidate-id",
+            payload.get("candidate_id", ""),
+        ]
+        if payload.get("action") == "revise_submit":
+            args.extend(["--revision", payload.get("revision", "")])
+
+        env = os.environ.copy()
+        env["PATH"] = f"{_Path.home() / '.bun/bin'}:/opt/homebrew/bin:" + env.get(
+            "PATH", ""
+        )
+
+        result_text = "GBrain週次レビューの処理に失敗しました。保存はしていません。"
+        result_cards: Optional[List[Dict[str, Any]]] = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=150)
+            if proc.returncode == 0:
+                try:
+                    result = json.loads(stdout.decode("utf-8") or "{}")
+                    if isinstance(result, dict):
+                        result_text = str(result.get("text") or result_text)
+                        cards_v2 = result.get("cardsV2")
+                        if isinstance(cards_v2, list):
+                            result_cards = cards_v2
+                except Exception:
+                    result_text = "GBrain週次レビューの処理結果を読めませんでした。保存はしていません。"
+        except asyncio.TimeoutError:
+            result_text = "GBrain週次レビューの処理が時間切れです。保存はしていません。"
+        except Exception:
+            logger.debug("[GoogleChat] GBrain weekly-review action failed", exc_info=True)
+
+        body: Dict[str, Any] = {"text": result_text}
+        if result_cards is not None:
+            body = {"text": result_text, "cardsV2": result_cards}
+
+        message_name = payload.get("message_name") or ""
+        if message_name:
+            try:
+                await self._patch_message(message_name, body)
+                return
+            except Exception:
+                logger.debug(
+                    "[GoogleChat] GBrain weekly-review patch failed",
+                    exc_info=True,
+                )
+
+        space_name = payload.get("space_name") or ""
+        if not space_name:
+            return
+        thread_name = payload.get("thread_name") or ""
+        if thread_name:
+            body["thread"] = {"name": thread_name}
+        try:
+            await self._create_message(space_name, body)
+        except Exception:
+            logger.debug(
+                "[GoogleChat] GBrain weekly-review reply failed",
+                exc_info=True,
+            )
+
+    # ------------------------------------------------------------------
     # Bot identity resolution
     # ------------------------------------------------------------------
     def _bot_id_cache_path(self) -> _Path:
@@ -1208,11 +1434,17 @@ class GoogleChatAdapter(BasePlatformAdapter):
                 message.ack()
                 return
 
-            # --- Card-click events (v2 follow-up) ---
+            # --- Card-click/widget events ---
             if "widget" in ce_type or "card" in ce_type.lower():
-                logger.info(
-                    "[GoogleChat] Card/widget event ack'd (v2 feature, deferred)"
-                )
+                action_payload = self._extract_gbrain_weekly_review_action(envelope)
+                if action_payload is not None:
+                    self._submit_on_loop(
+                        self._handle_gbrain_weekly_review_action(action_payload)
+                    )
+                else:
+                    logger.info(
+                        "[GoogleChat] Card/widget event ack'd (unsupported action)"
+                    )
                 message.ack()
                 return
 

@@ -228,6 +228,117 @@ def _make_chat_envelope(text="hello", sender_email="u@example.com", sender_type=
 
 
 # ===========================================================================
+# GBrain weekly-review card actions
+# ===========================================================================
+
+
+class TestGBrainWeeklyReviewCardActions:
+    def test_extracts_revise_submit_payload_without_event_body(self, adapter):
+        envelope = {
+            "chat": {
+                "appInteractionPayload": {
+                    "message": {
+                        "name": "spaces/S/messages/M",
+                        "space": {"name": "spaces/S"},
+                        "thread": {"name": "spaces/S/threads/T"},
+                    },
+                    "common": {
+                        "invokedFunction": "gbrain_weekly_review_revise_submit",
+                        "parameters": [
+                            {"key": "candidate_id", "value": "gbrain-1"},
+                            {"key": "revision_field", "value": "revision_gbrain_1"},
+                        ],
+                        "formInputs": {
+                            "revision_gbrain_1": {
+                                "stringInputs": {"value": ["修正後の原則"]}
+                            }
+                        },
+                    },
+                }
+            }
+        }
+
+        payload = adapter._extract_gbrain_weekly_review_action(envelope)
+
+        assert payload == {
+            "action": "revise_submit",
+            "candidate_id": "gbrain-1",
+            "revision": "修正後の原則",
+            "message_name": "spaces/S/messages/M",
+            "space_name": "spaces/S",
+            "thread_name": "spaces/S/threads/T",
+        }
+
+    def test_ignores_non_gbrain_card_action(self, adapter):
+        envelope = {
+            "chat": {
+                "appInteractionPayload": {
+                    "common": {
+                        "invokedFunction": "other_action",
+                        "parameters": [{"key": "candidate_id", "value": "gbrain-1"}],
+                    }
+                }
+            }
+        }
+
+        assert adapter._extract_gbrain_weekly_review_action(envelope) is None
+
+    @pytest.mark.asyncio
+    async def test_revise_action_patches_card(self, adapter, tmp_path, monkeypatch):
+        script = tmp_path / "gbrain-weekly-review.sh"
+        script.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' '{\"ok\":true,\"text\":\"修正内容を入力してください\","
+            "\"cardsV2\":[{\"cardId\":\"revise\",\"card\":{\"sections\":[]}}]}'\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        monkeypatch.setenv("GBRAIN_WEEKLY_REVIEW_SCRIPT", str(script))
+        adapter._patch_message = AsyncMock()
+
+        await adapter._handle_gbrain_weekly_review_action({
+            "action": "revise",
+            "candidate_id": "gbrain-1",
+            "revision": "",
+            "message_name": "spaces/S/messages/M",
+            "space_name": "spaces/S",
+            "thread_name": "spaces/S/threads/T",
+        })
+
+        adapter._patch_message.assert_awaited_once()
+        args, _kwargs = adapter._patch_message.call_args
+        assert args[0] == "spaces/S/messages/M"
+        assert args[1]["text"] == "修正内容を入力してください"
+        assert args[1]["cardsV2"][0]["cardId"] == "revise"
+
+    @pytest.mark.asyncio
+    async def test_approve_action_patches_text_result(self, adapter, tmp_path, monkeypatch):
+        script = tmp_path / "gbrain-weekly-review.sh"
+        script.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' '{\"ok\":true,\"text\":\"GBrainへ保存しました: principles/test\"}'\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        monkeypatch.setenv("GBRAIN_WEEKLY_REVIEW_SCRIPT", str(script))
+        adapter._patch_message = AsyncMock()
+
+        await adapter._handle_gbrain_weekly_review_action({
+            "action": "approve",
+            "candidate_id": "gbrain-1",
+            "revision": "",
+            "message_name": "spaces/S/messages/M",
+            "space_name": "spaces/S",
+            "thread_name": "spaces/S/threads/T",
+        })
+
+        adapter._patch_message.assert_awaited_once_with(
+            "spaces/S/messages/M",
+            {"text": "GBrainへ保存しました: principles/test"},
+        )
+
+
+# ===========================================================================
 # Platform registration + requirements
 # ===========================================================================
 
