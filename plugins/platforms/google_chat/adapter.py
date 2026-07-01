@@ -840,6 +840,16 @@ class GoogleChatAdapter(BasePlatformAdapter):
             "thread_name": str(thread_name or ""),
         }
 
+    def _is_card_click_event(self, envelope: Dict[str, Any], ce_type: str) -> bool:
+        if "widget" in ce_type or "card" in ce_type.lower():
+            return True
+        for item in self._walk_mappings(envelope):
+            for key in ("type", "event_type"):
+                raw = item.get(key)
+                if isinstance(raw, str) and raw.upper() == "CARD_CLICKED":
+                    return True
+        return False
+
     async def _handle_gbrain_weekly_review_action(
         self, payload: Dict[str, str]
     ) -> None:
@@ -1435,7 +1445,7 @@ class GoogleChatAdapter(BasePlatformAdapter):
                 return
 
             # --- Card-click/widget events ---
-            if "widget" in ce_type or "card" in ce_type.lower():
+            if self._is_card_click_event(envelope, ce_type):
                 action_payload = self._extract_gbrain_weekly_review_action(envelope)
                 if action_payload is not None:
                     self._submit_on_loop(

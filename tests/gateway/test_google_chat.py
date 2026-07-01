@@ -662,6 +662,45 @@ class TestOnPubsubMessage:
             submit.assert_called_once()
         msg.ack.assert_called_once()
 
+    def test_card_clicked_body_type_routes_gbrain_action(self, adapter):
+        envelope = {
+            "type": "CARD_CLICKED",
+            "chat": {
+                "appInteractionPayload": {
+                    "message": {
+                        "name": "spaces/S/messages/M",
+                        "space": {"name": "spaces/S"},
+                        "thread": {"name": "spaces/S/threads/T"},
+                    },
+                    "common": {
+                        "invokedFunction": "gbrain_weekly_review_approve",
+                        "parameters": [
+                            {
+                                "key": "candidate_id",
+                                "value": "gbrain-initial-human-approval-gate",
+                            }
+                        ],
+                    },
+                }
+            },
+        }
+        msg = _make_pubsub_message(envelope, attributes={"ce-type": ""})
+
+        with patch.object(adapter, "_handle_gbrain_weekly_review_action") as handle:
+            with patch.object(adapter, "_submit_on_loop") as submit:
+                adapter._on_pubsub_message(msg)
+
+        submit.assert_called_once()
+        handle.assert_called_once_with({
+            "action": "approve",
+            "candidate_id": "gbrain-initial-human-approval-gate",
+            "revision": "",
+            "message_name": "spaces/S/messages/M",
+            "space_name": "spaces/S",
+            "thread_name": "spaces/S/threads/T",
+        })
+        msg.ack.assert_called_once()
+
     def test_callback_exception_does_not_escape(self, adapter):
         env = _make_chat_envelope(text="hola")
         msg = _make_pubsub_message(env)
