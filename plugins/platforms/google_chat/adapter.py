@@ -1446,15 +1446,18 @@ class GoogleChatAdapter(BasePlatformAdapter):
 
             # --- Card-click/widget events ---
             if self._is_card_click_event(envelope, ce_type):
+                logger.info("[GoogleChat] CARD_CLICKED seen")
                 action_payload = self._extract_gbrain_weekly_review_action(envelope)
                 if action_payload is not None:
+                    logger.info(
+                        "[GoogleChat] CARD_CLICKED handled action=%s",
+                        action_payload.get("action", "unknown"),
+                    )
                     self._submit_on_loop(
                         self._handle_gbrain_weekly_review_action(action_payload)
                     )
                 else:
-                    logger.info(
-                        "[GoogleChat] Card/widget event ack'd (unsupported action)"
-                    )
+                    logger.info("[GoogleChat] CARD_CLICKED unsupported")
                 message.ack()
                 return
 
