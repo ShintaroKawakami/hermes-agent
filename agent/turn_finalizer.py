@@ -140,6 +140,9 @@ def finalize_turn(
     # can replay assistant("(empty)") / recovery nudges and fall into the
     # same empty-response loop again.
     agent._drop_trailing_empty_response_scaffolding(messages)
+    if interrupted:
+        from agent.message_sanitization import close_interrupted_tool_sequence
+        close_interrupted_tool_sequence(messages, final_response)
     agent._persist_session(messages, conversation_history)
 
     # ── Turn-exit diagnostic log ─────────────────────────────────────
