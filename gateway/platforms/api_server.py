@@ -37,12 +37,14 @@ Requires:
 import asyncio
 import hashlib
 import hmac
+import html
 import json
 import logging
 import os
 import socket as _socket
 import re
 import sqlite3
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -99,6 +101,8 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+GBRAIN_WEEKLY_REVIEW_ACTIONS = frozenset({"approve", "reject", "revise"})
+GBRAIN_WEEKLY_REVIEW_SCRIPT = Path.home() / ".hermes" / "scripts" / "gbrain-weekly-review.sh"
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -136,6 +140,32 @@ def _coerce_request_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, (int, float)):
         return bool(value)
     return default
+
+
+def _gbrain_weekly_review_secret() -> str:
+    return os.getenv("GBRAIN_WEEKLY_REVIEW_APPROVAL_SECRET", "")
+
+
+def _gbrain_weekly_review_signature(action: str, candidate_id: str, expires: str, secret: str) -> str:
+    signing_input = "\n".join([action, candidate_id, expires]).encode("utf-8")
+    return hmac.new(secret.encode("utf-8"), signing_input, hashlib.sha256).hexdigest()
+
+
+def _html_response(title: str, body: str, *, status: int = 200) -> "web.Response":
+    escaped_title = html.escape(title)
+    escaped_body = html.escape(body).replace("\n", "<br>")
+    document = (
+        "<!doctype html><html lang=\"ja\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+        f"<title>{escaped_title}</title>"
+        "<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
+        "line-height:1.7;margin:32px;max-width:720px;color:#1f2937}"
+        "button{font:inherit;padding:10px 14px;border-radius:6px;border:1px solid #9ca3af;background:#111827;color:white}"
+        "textarea{box-sizing:border-box;width:100%;min-height:160px;font:inherit;padding:10px;border:1px solid #9ca3af;border-radius:6px}"
+        ".meta{color:#6b7280}</style></head><body>"
+        f"<h1>{escaped_title}</h1><p>{escaped_body}</p></body></html>"
+    )
+    return web.Response(text=document, status=status, content_type="text/html")
 
 
 def _normalize_chat_content(
@@ -1095,6 +1125,97 @@ class APIServerAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # HTTP Handlers
     # ------------------------------------------------------------------
+
+    async def _handle_gbrain_weekly_review_action(self, request: "web.Request") -> "web.Response":
+        """GET/POST /gbrain/weekly-review/action — signed human approval link."""
+        if request.method == "POST":
+            form = await request.post()
+            params = dict(request.query)
+            for key in ("action", "candidate_id", "expires", "sig", "revision"):
+                if key in form:
+                    params[key] = str(form[key])
+        else:
+            params = dict(request.query)
+
+        action = str(params.get("action", "")).strip()
+        candidate_id = str(params.get("candidate_id", "")).strip()
+        expires = str(params.get("expires", "")).strip()
+        sig = str(params.get("sig", "")).strip()
+        revision = str(params.get("revision", ""))
+
+        if action not in GBRAIN_WEEKLY_REVIEW_ACTIONS:
+            return _html_response("GBrain週次レビュー", "未対応の操作です。", status=400)
+        if not candidate_id:
+            return _html_response("GBrain週次レビュー", "候補IDがありません。", status=400)
+        if not expires.isdigit() or int(expires) < int(time.time()):
+            return _html_response("GBrain週次レビュー", "この承認URLは期限切れです。", status=403)
+        secret = _gbrain_weekly_review_secret()
+        if not secret:
+            return _html_response("GBrain週次レビュー", "承認URLのsecretが未設定です。", status=503)
+        expected = _gbrain_weekly_review_signature(action, candidate_id, expires, secret)
+        if not hmac.compare_digest(sig, expected):
+            return _html_response("GBrain週次レビュー", "承認URLの署名が一致しません。", status=403)
+
+        if action == "revise" and request.method != "POST":
+            escaped_candidate = html.escape(candidate_id, quote=True)
+            escaped_expires = html.escape(expires, quote=True)
+            escaped_sig = html.escape(sig, quote=True)
+            document = (
+                "<!doctype html><html lang=\"ja\"><head><meta charset=\"utf-8\">"
+                "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+                "<title>GBrain週次レビュー 修正</title>"
+                "<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
+                "line-height:1.7;margin:32px;max-width:720px;color:#1f2937}"
+                "button{font:inherit;padding:10px 14px;border-radius:6px;border:1px solid #9ca3af;background:#111827;color:white}"
+                "textarea{box-sizing:border-box;width:100%;min-height:160px;font:inherit;padding:10px;border:1px solid #9ca3af;border-radius:6px}</style>"
+                "</head><body><h1>GBrain週次レビュー 修正</h1>"
+                "<p>修正文を入力してください。この時点ではGBrainへ保存しません。</p>"
+                "<form method=\"post\" action=\"/gbrain/weekly-review/action\">"
+                "<input type=\"hidden\" name=\"action\" value=\"revise\">"
+                f"<input type=\"hidden\" name=\"candidate_id\" value=\"{escaped_candidate}\">"
+                f"<input type=\"hidden\" name=\"expires\" value=\"{escaped_expires}\">"
+                f"<input type=\"hidden\" name=\"sig\" value=\"{escaped_sig}\">"
+                "<textarea name=\"revision\" required></textarea><p><button type=\"submit\">修正を送信</button></p>"
+                "</form></body></html>"
+            )
+            return web.Response(text=document, content_type="text/html")
+
+        script_action = "revise_submit" if action == "revise" and revision else action
+        cmd = [
+            str(GBRAIN_WEEKLY_REVIEW_SCRIPT),
+            "--action",
+            script_action,
+            "--candidate-id",
+            candidate_id,
+        ]
+        if script_action == "revise_submit":
+            cmd.extend(["--revision", revision])
+        try:
+            proc = await asyncio.to_thread(
+                subprocess.run,
+                cmd,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+        except subprocess.TimeoutExpired:
+            return _html_response("GBrain週次レビュー", "処理がタイムアウトしました。", status=504)
+        except Exception:
+            logger.exception("[api_server] gbrain weekly review action failed")
+            return _html_response("GBrain週次レビュー", "処理の起動に失敗しました。", status=500)
+
+        output = (proc.stdout or proc.stderr or "").strip()
+        message = output
+        try:
+            payload = json.loads(output or "{}")
+            if isinstance(payload, dict):
+                message = str(payload.get("text") or output)
+        except Exception:
+            pass
+        if proc.returncode != 0:
+            return _html_response("GBrain週次レビュー", message or "処理に失敗しました。", status=500)
+        return _html_response("GBrain週次レビュー", message or "処理しました。")
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
@@ -4282,6 +4403,8 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/health", self._handle_health)
             self._app.router.add_get("/health/detailed", self._handle_health_detailed)
             self._app.router.add_get("/v1/health", self._handle_health)
+            self._app.router.add_get("/gbrain/weekly-review/action", self._handle_gbrain_weekly_review_action)
+            self._app.router.add_post("/gbrain/weekly-review/action", self._handle_gbrain_weekly_review_action)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
             self._app.router.add_get("/v1/skills", self._handle_skills)
